@@ -13,8 +13,11 @@ include_once 'DaemonChildClass.php';
 class DaemonClass
 {
     private int $pid;
-    /** @var Process */
-    private $process;
+    private Process $process;
+    /**
+     * кол-во объектов на обработку
+     */
+    private int $queue = 0;
     /**
      * Максимальное количество дочерних процессов
      */
@@ -39,42 +42,42 @@ class DaemonClass
         pcntl_signal(SIGCHLD, array($this, "childSignalHandler"));
     }
 
+    private function start()
+    {
+        $this->log("Running daemon controller");
+        file_put_contents(__DIR__ . '/daemon.pid', $this->pid);
+        // $this->queue ?? - узнаем кол-во объектов на обработку из бд
+        if ($this->queue == 0) {
+            // Нет объектов на обработку, зря стартовали
+            $this->childSignalHandler(SIGTERM);
+        }
+    }
+
     public function run()
     {
         if ($this->isDaemonActive(__DIR__ . '/daemon.pid')) {
-            $this->log('Daemon already active');
             exit;
         }
-        $this->log("Running daemon controller");
-        file_put_contents(__DIR__ . '/daemon.pid', $this->pid);
+        $this->start();
 
         // Пока $stop_server не установится в TRUE, гоняем бесконечный цикл
         while (!$this->stop_server) {
             // Если уже запущено максимальное количество дочерних процессов, ждем их завершения
             while (count($this->currentJobs) >= $this->maxProcesses) {
                 $this->log("Maximum children allowed, waiting...");
-                //
-                foreach ($this->currentJobs as $pid => $value) {
-                    $statusPid = $this->process->setPid($pid)->status();
-                    $this->log("$pid status: " . ($statusPid ? 'on' : 'off'));
-                    if (!$statusPid) {
-                        // принудительно удалить процесс из системы и списка у завершённого процесса <defunct>
-                        $this->childSignalHandler(SIGCHLD, $pid);
-                    }
-                    // if ($pid > 100) {
-                    //     $this->childSignalHandler(SIGTERM);
-                    // }
-                }
-                // Обновить статусы работы у дочерних процессов
-                // https://stackoverflow.com/questions/19546588/process-from-pcntl-fork-not-terminating
-                pcntl_wait($status);
-                sleep(5);
+                $this->updateStatus();
             }
-
-            if (!$this->launchJob()) {
-                exit;
+            // если есть объекты в очереди, создаём демона
+            if ($this->queue) {
+                if (!$this->launchJob()) {
+                    // exit;
+                }
+                sleep(1); // мини пауза
+            } else {
+                $this->updateStatus();
             }
         }
+        $this->log("stop");
     }
 
     /**
@@ -82,13 +85,15 @@ class DaemonClass
      * @param [type] $pid_file
      * @return boolean
      */
-    function isDaemonActive($pid_file)
+    private function isDaemonActive($pid_file)
     {
         if (is_file($pid_file)) {
             $pid = file_get_contents($pid_file);
             //проверяем на наличие процесса
-            if (posix_kill($pid, 0)) {
+            $statusPid = $this->process->setPid($pid)->status();
+            if ($statusPid) {
                 //демон уже запущен
+                $this->log('Daemon already active: ' . $pid);
                 return true;
             } else {
                 //pid-файл есть, но процесса нет 
@@ -101,11 +106,39 @@ class DaemonClass
         return false;
     }
 
+    private function updateStatus()
+    {
+        $this->log("currentJobs: " . count($this->currentJobs));
+        foreach ($this->currentJobs as $pid => $value) {
+            $statusPid = $this->process->setPid($pid)->status();
+            $this->log("$pid status: " . ($statusPid ? 'on' : 'off'));
+            if (!$statusPid) {
+                // принудительно удалить процесс из системы и списка у завершённого процесса <defunct>
+                $this->childSignalHandler(SIGCHLD, $pid);
+            }
+            // if ($pid > 100) {
+            //     $this->childSignalHandler(SIGTERM);
+            // }
+        }
+        // Обновляем статус $this->queue из бд
+        //
+        // Обновить статусы работы процессов в системе у дочерних процессов
+        pcntl_wait($status);
+        // Ожидаем
+        sleep(5);
+    }
+
     /**
      * Создаем дочерний процесс
      */
     protected function launchJob(): bool
     {
+        // Запрашиваем объект на обработку и убираем его из очереди
+        // if (!$file = $this->getQueue()) {
+        //     $this->log("Больше нет файлов на обработку");
+        //     return FALSE;
+        // }
+        //
         // весь код после pcntl_fork() будет выполняться
         // двумя процессами: родительским и дочерним
         $pid = pcntl_fork();
@@ -146,7 +179,7 @@ class DaemonClass
             case SIGTERM:
                 // При получении сигнала завершения работы, устанавливаем флаг
                 $this->stop_server = true;
-                $this->log("stop");
+                $this->log("start stop");
                 break;
             case SIGCHLD:
                 // При получении сигнала от дочернего процесса
@@ -164,6 +197,11 @@ class DaemonClass
                     $pid = pcntl_waitpid(-1, $status, WNOHANG);
                     if ($pid > 0) $this->log("$pid status: " . ($status ? 'on' : 'off'));
                 }
+                // все дочернии процессы завершены и нет больше объектов на обработку
+                if (count($this->currentJobs) == 0 && $this->queue == 0) {
+                    // останавливаем демона
+                    $this->stop_server = true;
+                }
                 break;
             default:
                 // все остальные сигналы
@@ -176,6 +214,16 @@ class DaemonClass
      */
     public function log(string $msg)
     {
-        echo '[' . microtime() . '] pid:' . $this->pid . "|$msg" . PHP_EOL;
+        echo '[' . date('Y-m-d H:i:s') . '] pid:' . $this->pid . "|$msg" . PHP_EOL;
+    }
+
+    /**
+     * @param int $maxProcesses 
+     * @return self
+     */
+    public function setMaxProcesses(int $maxProcesses): self
+    {
+        $this->maxProcesses = $maxProcesses;
+        return $this;
     }
 }

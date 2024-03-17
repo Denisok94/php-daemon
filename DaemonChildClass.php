@@ -24,8 +24,11 @@ class DaemonChildClass
         return 1;
     }
 
-    public function log($msg)
+    /**
+     * @param string $msg
+     */
+    public function log(string $msg)
     {
-        echo '[' . microtime() . ']pid:' . $this->pid . "|$msg" . PHP_EOL;
+        echo '[' . date('Y-m-d H:i:s') . '] pid:' . $this->pid . "|$msg" . PHP_EOL;
     }
 }
